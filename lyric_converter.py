@@ -9,7 +9,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QMessageBox, QFileDialog,
-    QProgressBar, QGroupBox, QCheckBox
+    QProgressBar, QGroupBox, QCheckBox, QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
@@ -156,6 +156,14 @@ class LyricConverter:
     @staticmethod
     def convert_lyric_line(line):
         """转换单行歌词"""
+        line = line.strip()
+        if not line:
+            return None
+        
+        # 检查是否已经是小灰熊格式，如果是则跳过（避免重复转换）
+        if LyricConverter.KARAOKE_ADD_PATTERN.match(line):
+            return None
+        
         result = LyricConverter.extract_timestamps_and_lyric(line)
         
         if not result:
@@ -170,9 +178,119 @@ class LyricConverter:
         
         return f"karaoke.add('{start_time}', '{end_time}', '{lyric_text}', '{duration}');"
     
+    # 反向转换：匹配 karaoke.add('开始时间', '结束时间', '[歌词]', '时长');
+    KARAOKE_ADD_PATTERN = re.compile(
+        r"karaoke\.add\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\)\s*;"
+    )
+    
+    @staticmethod
+    def format_time_simple(time_str):
+        """将 MM:SS.mmm 格式转换为 M:SS.mmm 格式（去除前导零）"""
+        time_str = time_str.strip()
+        parts = time_str.split(':')
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds_part = parts[1]
+            return f"{minutes}:{seconds_part}"
+        return time_str
+    
+    @staticmethod
+    def reverse_convert_line(line):
+        """反向转换单行歌词（小灰熊格式 -> 标准时间轴）"""
+        line = line.strip()
+        if not line:
+            return None
+        
+        match = LyricConverter.KARAOKE_ADD_PATTERN.match(line)
+        if not match:
+            return None
+        
+        start_time = match.group(1)
+        end_time = match.group(2)
+        lyric_text = match.group(3)
+        
+        # 移除歌词两端的方括号
+        if lyric_text.startswith('[') and lyric_text.endswith(']'):
+            lyric_text = lyric_text[1:-1]
+        
+        # 格式化时间（去除前导零）
+        start_time = LyricConverter.format_time_simple(start_time)
+        end_time = LyricConverter.format_time_simple(end_time)
+        
+        return f"{start_time} {end_time} {lyric_text}"
+    
+    @staticmethod
+    def reverse_convert_file(input_path):
+        """反向转换整个文件（小灰熊格式 -> 标准时间轴）"""
+        # 尝试多种编码读取文件
+        encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'big5', 'shift-jis', 'euc-kr']
+        lines = None
+        
+        for encoding in encodings:
+            try:
+                with open(input_path, 'r', encoding=encoding) as f:
+                    lines = f.readlines()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        
+        if lines is None:
+            with open(input_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        
+        # 转换每一行歌词
+        output_lines = []
+        lyric_count = 0
+        for line in lines:
+            converted = LyricConverter.reverse_convert_line(line)
+            if converted:
+                output_lines.append(converted)
+                lyric_count += 1
+        
+        return "\n".join(output_lines), lyric_count
+    
+    @staticmethod
+    def is_karaoke_format(lines):
+        """检测文件是否已经是小灰熊格式"""
+        if not lines:
+            return False
+        
+        # 检查文件开头是否包含小灰熊格式的特征
+        karaoke_indicators = [
+            'karaoke := CreateKaraokeObject;',
+            'karaoke.rows :=',
+            'karaoke.clear;',
+            'karaoke.songname :=',
+            'karaoke.singer :='
+        ]
+        
+        # 统计包含小灰熊格式特征的行数
+        indicator_count = 0
+        karaoke_add_count = 0
+        
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # 检查是否包含小灰熊格式的特征标识
+            for indicator in karaoke_indicators:
+                if indicator in line_stripped:
+                    indicator_count += 1
+                    break
+            
+            # 检查是否包含 karaoke.add 语句
+            if LyricConverter.KARAOKE_ADD_PATTERN.search(line_stripped):
+                karaoke_add_count += 1
+        
+        # 如果同时满足以下条件，则认为是小灰熊格式：
+        # 1. 包含至少2个小灰熊格式特征标识（如 karaoke := CreateKaraokeObject; 和 karaoke.clear;）
+        # 2. 或者包含至少1个 karaoke.add 语句
+        return indicator_count >= 2 or karaoke_add_count >= 1
+    
     @staticmethod
     def convert_file(input_path, song_name=None, singer=None):
-        """转换整个文件"""
+        """正向转换整个文件（标准时间轴 -> 小灰熊格式）"""
         # 尝试多种编码读取文件
         encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'big5', 'shift-jis', 'euc-kr']
         lines = None
@@ -189,6 +307,14 @@ class LyricConverter:
             # 如果所有编码都失败，使用 utf-8 并忽略错误
             with open(input_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
+        
+        # 检测是否已经是小灰熊格式
+        if LyricConverter.is_karaoke_format(lines):
+            # 如果已经是小灰熊格式，直接返回原文件内容
+            original_content = ''.join(lines)
+            # 统计已有的歌词行数
+            lyric_count = sum(1 for line in lines if LyricConverter.KARAOKE_ADD_PATTERN.search(line.strip()))
+            return original_content, lyric_count
         
         # 如果没有提供歌曲名，使用文件名
         if not song_name:
@@ -231,8 +357,8 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         """初始化界面"""
         self.setWindowTitle("小灰熊歌词格式转换器")
-        self.setMinimumSize(650, 450)
-        self.resize(650, 500)  # 设置初始大小
+        self.setMinimumSize(650, 500)
+        self.resize(650, 550)  # 设置初始大小
         
         # 创建中心部件
         central_widget = QWidget()
@@ -276,6 +402,24 @@ class MainWindow(QMainWindow):
         file_layout.addLayout(button_layout)
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
+        
+        # 转换模式选择区域
+        mode_group = QGroupBox("转换模式")
+        mode_layout = QHBoxLayout()
+        
+        self.mode_button_group = QButtonGroup(self)
+        
+        self.mode_forward = QRadioButton("正向：时间轴 → 小灰熊格式")
+        self.mode_forward.setChecked(True)  # 默认选择正向
+        self.mode_button_group.addButton(self.mode_forward, 0)
+        
+        self.mode_reverse = QRadioButton("反向：小灰熊格式 → 时间轴")
+        self.mode_button_group.addButton(self.mode_reverse, 1)
+        
+        mode_layout.addWidget(self.mode_forward)
+        mode_layout.addWidget(self.mode_reverse)
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
         
         # 进度条
         self.progress_bar = QProgressBar()
@@ -391,6 +535,9 @@ class MainWindow(QMainWindow):
         # 禁用按钮
         self.convert_btn.setEnabled(False)
         
+        # 获取转换模式（0=正向，1=反向）
+        is_reverse_mode = self.mode_button_group.checkedId() == 1
+        
         # 获取编码选项
         use_ansi = self.ansi_checkbox.isChecked()
         output_encoding = 'gbk' if use_ansi else 'utf-8'
@@ -404,8 +551,13 @@ class MainWindow(QMainWindow):
             try:
                 self.statusBar().showMessage(f"正在转换: {os.path.basename(file_path)}")
                 
-                # 转换
-                output_content, lyric_count = LyricConverter.convert_file(file_path)
+                # 根据模式选择转换方法
+                if is_reverse_mode:
+                    # 反向转换：小灰熊格式 -> 标准时间轴
+                    output_content, lyric_count = LyricConverter.reverse_convert_file(file_path)
+                else:
+                    # 正向转换：标准时间轴 -> 小灰熊格式
+                    output_content, lyric_count = LyricConverter.convert_file(file_path)
                 
                 # 保存
                 output_filename = Path(file_path).stem + "_Converted.txt"
